@@ -136,8 +136,6 @@ func DoRequest(url string, timeout int, headers map[string]string) ([]byte, erro
 
 // Get ... Performs HTTP GET request and returns response bytes
 func Get(url string, timeout int, maxRetries int) ([]byte, error) {
-	log.Printf("GET request to %s (timeout: %d, retries: %d)", url, timeout, maxRetries)
-
 	client := &http.Client{
 		Timeout: time.Duration(timeout) * time.Second,
 	}
@@ -171,8 +169,6 @@ func SaveFile(data []byte, path string) error {
 
 // Save files from CDX Response channel into output directory
 func SaveFiles(results <-chan []*CdxResponse, outputDir string, errors chan error, downloadRate float32) {
-	log.Println("[SaveFiles] worker started:", outputDir)
-
 	for resBatch := range results {
 		for _, res := range resBatch {
 			data, err := res.Source.GetFile(res)

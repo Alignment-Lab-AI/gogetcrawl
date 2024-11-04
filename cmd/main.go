@@ -42,9 +42,11 @@ from 2 different web archive sources - Wayback Mahine and Common Crawl.
 You can use different filters and arguments to solve your task more effectively.`,
 }
 
-var sources []common.Source
-var results = make(chan []*common.CdxResponse)
-var errors = make(chan error)
+var (
+	sources []common.Source
+	results = make(chan []*common.CdxResponse)
+	errors  = make(chan error)
+)
 
 func initSources() {
 	for _, s := range sourceNames {
@@ -72,7 +74,7 @@ func initSources() {
 	}
 }
 
-// Prepare arvhive request configs
+// Prepare archive request configs
 func getRequestConfigs(args []string) chan common.RequestConfig {
 	confChan := make(chan common.RequestConfig, len(args))
 
@@ -93,15 +95,18 @@ func getRequestConfigs(args []string) chan common.RequestConfig {
 		filters = append(filters, "statuscode:200")
 	}
 
+	var err error
+	var fromDate, toDate time.Time
+
 	if fromDateFilter != "" {
-		if _, err := time.Parse("20060102", fromDateFilter); err != nil {
-			log.Fatalln(fmt.Sprintf("Please check `--from` filter date: '%v', %v", fromDateFilter, err))
+		if fromDate, err = time.Parse("20060102", fromDateFilter); err != nil {
+			log.Fatalf("Please check `--from` filter date: '%v', %v", fromDateFilter, err)
 		}
 	}
 
 	if toDateFilter != "" {
-		if _, err := time.Parse("20060102", toDateFilter); err != nil {
-			log.Fatalln(fmt.Sprintf("Please check `--to` filter date: '%v', %v", toDateFilter, err))
+		if toDate, err = time.Parse("20060102", toDateFilter); err != nil {
+			log.Fatalf("Please check `--to` filter date: '%v', %v", toDateFilter, err)
 		}
 	}
 
@@ -110,8 +115,8 @@ func getRequestConfigs(args []string) chan common.RequestConfig {
 			URL:      domain,
 			Filters:  filters,
 			Limit:    maxResults,
-			FromDate: fromDateFilter,
-			ToDate:   toDateFilter,
+			FromDate: fromDate,
+			ToDate:   toDate,
 		}
 
 		if isCollapse {
@@ -133,7 +138,7 @@ func initArgs() {
 	writers := []io.Writer{}
 
 	if isLogging {
-		file, err := os.OpenFile("./logs.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+		file, err := os.OpenFile("./logs.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o666)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -164,5 +169,5 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&isLogging, "log", "", false, `Print logs to ./logs.txt.`)
 	rootCmd.PersistentFlags().StringVarP(&fromDateFilter, "from", "", "", "Filter from date, example: --from 20200131 (filter from 31 Jan 2020)")
 	rootCmd.PersistentFlags().StringVarP(&toDateFilter, "to", "", "", "Filter to date, example: --to 20230401 (filter to 1 Apr 2023)")
-	//TODOrootCmd.PersistentFlags().BoolVarP(&isDisablePagination, "disable-pagination", "", "", "")
+	// TODOrootCmd.PersistentFlags().BoolVarP(&isDisablePagination, "disable-pagination", "", "", "")
 }

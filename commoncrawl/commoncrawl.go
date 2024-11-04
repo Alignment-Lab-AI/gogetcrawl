@@ -4,22 +4,47 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"strconv"
+	"strings"
+	"time"
 
 	jsoniter "github.com/json-iterator/go"
 	common "github.com/karust/gogetcrawl/common"
 	"github.com/slyrz/warc"
 )
 
-const INDEX_SERVER = "https://index.commoncrawl.org/"
-const CRAWL_STORAGE = "https://data.commoncrawl.org/" // https://commoncrawl.s3.amazonaws.com/
+const (
+	INDEX_SERVER  = "https://index.commoncrawl.org/"
+	CRAWL_STORAGE = "https://data.commoncrawl.org/" // https://commoncrawl.s3.amazonaws.com/
+)
+
+// CustomTime is a wrapper for time.Time to implement custom JSON unmarshaling
+type CustomTime time.Time
+
+// UnmarshalJSON implements json.Unmarshaler interface
+func (ct *CustomTime) UnmarshalJSON(b []byte) error {
+	s := string(b)
+
+	// Remove any surrounding quotes
+	s = strings.Trim(s, "\"")
+
+	t, err := time.Parse("2006-01-02T15:04:05", s)
+	if err != nil {
+		return err
+	}
+	*ct = CustomTime(t)
+	return nil
+}
 
 // JSON response containing latest index name at http://index.commoncrawl.org/collinfo.json
 type latestIndex struct {
-	Id       string `json:"id"`
-	Name     string `json:"name"`
-	Timegate string `json:"timegate"`
-	CdxAPI   string `json:"cdx-api"`
+	Id       string     `json:"id"`
+	Name     string     `json:"name"`
+	Timegate string     `json:"timegate"`
+	CdxAPI   string     `json:"cdx-api"`
+	From     CustomTime `json:"from"`
+	To       CustomTime `json:"to"`
 }
 
 // ex: http://index.commoncrawl.org/CC-MAIN-2015-11-index?url=*.wikipedia.org/&showNumPages=true
@@ -37,11 +62,10 @@ type CommonCrawl struct {
 
 func New(timeout, retries int) (*CommonCrawl, error) {
 	source := &CommonCrawl{MaxTimeout: timeout, MaxRetries: retries}
-
-	// Cache latest indexes to not overload the server
 	var err error
 	source.indexes, err = source.GetIndexes()
 	if err != nil {
+		log.Printf("Error fetching indexes: %v", err)
 		return nil, err
 	}
 
@@ -54,15 +78,17 @@ func (CommonCrawl) Name() string {
 
 // Get latest CDX indexes from http://index.commoncrawl.org/collinfo.json
 func (cc *CommonCrawl) GetIndexes() ([]latestIndex, error) {
-	response, err := common.Get(INDEX_SERVER+"/collinfo.json", cc.MaxTimeout, cc.MaxRetries)
+	response, err := common.Get(INDEX_SERVER+"collinfo.json", cc.MaxTimeout, cc.MaxRetries)
 	if err != nil {
-		return nil, fmt.Errorf("[GetIndexIDs] response read error: %v", err)
+		return nil, fmt.Errorf("[GetIndexes] response read error: %v", err)
 	}
 
 	latestIndexes := []latestIndex{}
 	err = jsoniter.Unmarshal(response, &latestIndexes)
 	if err != nil {
-		return latestIndexes, fmt.Errorf("[GetIndexIDs] Cannot get latest index ID: %v", err)
+		log.Printf("JSON Unmarshal error: %v", err)
+		log.Printf("Response content: %s", string(response))
+		return latestIndexes, fmt.Errorf("[GetIndexes] Cannot get latest index ID: %v", err)
 	}
 
 	return latestIndexes, nil
@@ -106,7 +132,7 @@ func (cc *CommonCrawl) ParseResponse(resp []byte) ([]*common.CdxResponse, error)
 	for _, line := range bytes.Split(resp[:len(resp)-1], []byte{'\n'}) {
 		var indexVal common.CdxResponse
 		if err := jsoniter.Unmarshal(line, &indexVal); err != nil {
-			return nil, fmt.Errorf("[ParseResponse] Cannot decode JSON line: %v. Response: %v", err, string(line))
+			return nil, fmt.Errorf("[ParseResponse] Cannot decode JSON line: %w. Response: %v", err, string(line))
 		}
 		indexVal.Source = cc
 		pages = append(pages, &indexVal)
@@ -140,12 +166,12 @@ func (cc *CommonCrawl) GetPagesIndex(config common.RequestConfig, index string) 
 
 		response, err := common.Get(reqURL, cc.MaxTimeout, cc.MaxRetries)
 		if err != nil {
-			return results, fmt.Errorf("[GetPagesIndex] Request error: %v", err)
+			return results, fmt.Errorf("[GetPagesIndex] Request error: %w", err)
 		}
 
 		parsedResponse, err := cc.ParseResponse(response)
 		if err != nil {
-			return results, fmt.Errorf("[GetPagesIndex] Cannot parse response: %v", err)
+			return results, fmt.Errorf("[GetPagesIndex] Cannot parse response: %w", err)
 		}
 		results = append(results, parsedResponse...)
 		numResults += len(parsedResponse)
@@ -170,40 +196,61 @@ func (cc *CommonCrawl) GetPages(config common.RequestConfig) ([]*common.CdxRespo
 //
 //	index: needs to be set manually here
 func (cc *CommonCrawl) FetchPages(config common.RequestConfig, results chan []*common.CdxResponse, errors chan error) {
-	var pages int
 	var err error
-
-	if config.SinglePage {
-		pages = 1
-	} else {
-		pages, err = cc.GetNumPages(config.URL)
-		if err != nil {
-			errors <- err
-		}
-	}
 
 	numResults := 0
 
-	for page := 0; page < pages; page++ {
-		indexURL := fmt.Sprintf("%v%v-index", INDEX_SERVER, cc.indexes[0].Id)
-		reqURL := config.GetUrl(indexURL, page)
-
-		response, err := common.Get(reqURL, cc.MaxTimeout, cc.MaxRetries)
-		if err != nil {
-			errors <- fmt.Errorf("[FetchPages] Request error: %v", err)
+	for _, idx := range cc.filterIndices(config) {
+		pages := 1
+		if !config.SinglePage {
+			pages, err = cc.GetNumPagesIndex(config.URL, idx)
+			if err != nil {
+				errors <- err
+			}
 		}
 
-		parsedResponse, err := cc.ParseResponse(response)
-		if err != nil {
-			errors <- fmt.Errorf("[FetchPages] Cannot parse response: %v", err)
-		}
-		numResults += len(parsedResponse)
-		results <- parsedResponse
+		indexURL := fmt.Sprintf("%v%v-index", INDEX_SERVER, idx)
+		for page := 0; page < pages; page++ {
+			reqURL := config.GetUrl(indexURL, page)
 
-		if config.Limit != 0 && uint(numResults) >= config.Limit {
-			return
+			response, err := common.Get(reqURL, cc.MaxTimeout, cc.MaxRetries)
+			if err != nil {
+				errors <- fmt.Errorf("[FetchPages] Request error: %w", err)
+			}
+
+			parsedResponse, err := cc.ParseResponse(response)
+			if err != nil {
+				errors <- fmt.Errorf("[FetchPages] Cannot parse response: %w", err)
+			}
+			numResults += len(parsedResponse)
+			results <- parsedResponse
+
+			if config.Limit != 0 && uint(numResults) >= config.Limit {
+				return
+			}
 		}
 	}
+}
+
+// Get indices that match the filter date criteria
+func (cc *CommonCrawl) filterIndices(config common.RequestConfig) []string {
+	// no date filter, just use the first index
+	if config.FromDate.IsZero() && config.ToDate.IsZero() {
+		return []string{cc.indexes[0].Id}
+	}
+
+	indices := []string{}
+	for _, idx := range cc.indexes {
+		if !config.FromDate.IsZero() && config.FromDate.After(time.Time(idx.From)) {
+			continue
+		}
+		if !config.ToDate.IsZero() && config.ToDate.Before(time.Time(idx.To)) {
+			continue
+		}
+		indices = append(indices, idx.Id)
+	}
+	log.Printf("Filtered indices: %v", indices)
+	return indices
 }
 
 // Gets files from CommonCrawl storage using info from CdxResponse server
@@ -229,14 +276,10 @@ func (cc *CommonCrawl) GetFile(page *common.CdxResponse) ([]byte, error) {
 	}
 	defer reader.Close()
 
-	for {
-		record, err := reader.ReadRecord()
-		if err != nil {
-			return nil, fmt.Errorf("[GetFile] Cannot decode WARC: %v", err)
-		}
-
-		var buf bytes.Buffer
-		io.Copy(&buf, record.Content)
-		return buf.Bytes(), nil
+	record, err := reader.ReadRecord()
+	if err != nil {
+		return nil, fmt.Errorf("[GetFile] Cannot decode WARC: %v", err)
 	}
+
+	return io.ReadAll(record.Content)
 }
